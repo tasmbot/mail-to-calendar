@@ -8,7 +8,6 @@ import re
 from datetime import datetime, timedelta
 from requests.auth import HTTPBasicAuth
 
-# ПРАВИЛО: для латинских названий папок кодирование НЕ нужно
 TARGET_MAILBOX_NAME = "iCloud"
 
 def parse_russian_date(date_str):
@@ -17,85 +16,73 @@ def parse_russian_date(date_str):
         'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8,
         'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12
     }
-    
     match = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})', date_str, re.IGNORECASE)
     if match:
         day = int(match.group(1))
         month_name = match.group(2).lower()
         year = int(match.group(3))
-        
         if month_name in months:
-            month = months[month_name]
-            return datetime(year, month, day)
-    
+            return datetime(year, months[month_name], day)
     return None
 
 def parse_assignment_email(body_text, html_content=''):
-    assignments = []
-    debug_log = []
+    assignments, debug_log = [], []
     
     # Шаг 1: ищем дату
     date_match = re.search(r'необходимо сдать до\s+(.+?)(?:\.|$)', body_text, re.IGNORECASE)
     if not date_match:
-        debug_log.append("❌ Дата не найдена в тексте")
-        return [], debug_log
-    
-    debug_log.append(f"✅ Найдена строка даты: '{date_match.group(1)}'")
+        return [], ["❌ Дата не найдена"]
     
     deadline_date = parse_russian_date(date_match.group(1))
     if not deadline_date:
-        debug_log.append(f"❌ Не удалось распарсить дату: '{date_match.group(1)}'")
-        return [], debug_log
+        return [], [f"❌ Не удалось распарсить дату: '{date_match.group(1)}'"]
     
-    debug_log.append(f"✅ Дата распарсена: {deadline_date.strftime('%Y-%m-%d')}")
+    debug_log.append(f"✅ Дата: {deadline_date.strftime('%Y-%m-%d')}")
     
     # Шаг 2: извлекаем ссылки из HTML
     html_links = []
     if html_content:
         link_pattern = r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>.*?Перейти к элементу.*?</a>'
         html_links = re.findall(link_pattern, html_content, re.IGNORECASE | re.DOTALL)
-        debug_log.append(f"✅ Найдено ссылок в HTML: {len(html_links)}")
+        debug_log.append(f"✅ Ссылок в HTML: {len(html_links)}")
     
-    # Шаг 3: Ищем блоки заданий
-    assignment_pattern = r'(\*?\s*(?:Домашнее задание|Задание|Лабораторная|Контрольная|Тест)[\s\S]*?в курсе[^\(]+)'
-    matches = list(re.finditer(assignment_pattern, body_text, re.IGNORECASE))
+    # Шаг 3: УНИВЕРСАЛЬНЫЙ парсер
+    # Логика: [ЛЮБОЙ ТЕКСТ] в курсе [ЛЮБОЙ ТЕКСТ ДО СКОБКИ]
+    # Это покрывает ВСЕ форматы: "Домашнее задание 1", "ДЗ_1_Модуль_1", и любые другие
+    assignment_pattern = r'([^\n]+?)\s+в курсе\s+([^\n(]+?)(?:\s*\([^)]+\))?(?=\s*(?:Срок:|$))'
+    matches = list(re.finditer(assignment_pattern, body_text, re.IGNORECASE | re.MULTILINE))
+    
     debug_log.append(f"✅ Найдено блоков заданий: {len(matches)}")
     
     link_index = 0
-    
     for i, match in enumerate(matches):
-        assignment_block = match.group(1).strip()
+        task_name = match.group(1).strip()
+        course_name = match.group(2).strip()
         
-        # НОВОЕ: Упрощенный и надежный парсинг названия и курса
-        # Группа 1: "Домашнее задание 1" (или аналог)
-        # Группа 2: всё, что после "в курсе" и до первой скобки "("
-        course_match = re.search(
-            r'(Домашнее задание\s+\d+)[\s\S]*?в курсе\s+([^\(]+)', 
-            assignment_block, 
-            re.IGNORECASE
-        )
+        # Очищаем название задания от маркеров списка
+        task_name = re.sub(r'^\*\s*', '', task_name)  # Убираем "* " в начале
         
-        if course_match:
-            # ИСПРАВЛЕНИЕ КАПСА: capitalize() делает первую букву заглавной, остальные строчными
-            task_name = course_match.group(1).strip().capitalize()
-            
-            # ИСПРАВЛЕНИЕ КУРСА: берем текст до скобки, убираем переносы строк и лишние пробелы
-            course_name = course_match.group(2).strip().replace('\n', ' ').replace('\r', '')
-            # Убираем двойные пробелы, если они возникли после замены переноса строки
-            course_name = re.sub(r'\s+', ' ', course_name)
-            
-            link = html_links[link_index] if link_index < len(html_links) else None
-            link_index += 1
-            
-            assignments.append({
-                'task_name': task_name,
-                'course_name': course_name,
-                'deadline': deadline_date,
-                'link': link
-            })
-            debug_log.append(f"✅ Задание {i+1}: '{task_name}' | Курс: '{course_name}' | Ссылка: {'Есть' if link else 'Нет'}")
-        else:
-            debug_log.append(f"❌ Не удалось разобрать блок: '{assignment_block[:100]}...'")
+        # Форматируем название задания
+        if '_' in task_name:
+            # Если есть подчеркивания (ДЗ_1_Модуль_1), заменяем на пробелы
+            task_name = task_name.replace('_', ' ')
+        elif task_name.isupper():
+            # Если полностью капсом (ДОМАШНЕЕ ЗАДАНИЕ 1), делаем первую букву заглавной
+            task_name = task_name.capitalize()
+        
+        # Очищаем курс от переносов строк и лишних пробелов
+        course_name = re.sub(r'\s+', ' ', course_name.replace('\n', ' ').replace('\r', ''))
+        
+        link = html_links[link_index] if link_index < len(html_links) else None
+        link_index += 1
+        
+        assignments.append({
+            'task_name': task_name,
+            'course_name': course_name,
+            'deadline': deadline_date,
+            'link': link
+        })
+        debug_log.append(f"✅ Задание {i+1}: '{task_name}' | Курс: '{course_name}' | Ссылка: {'Есть' if link else 'Нет'}")
     
     return assignments, debug_log
 
@@ -111,32 +98,20 @@ def generate_ics_for_assignment(assignment):
     uid = re.sub(r'[^a-zA-Z0-9@.-]', '-', uid)
     
     summary = f"Дедлайн. {assignment['task_name']} в курсе {assignment['course_name']}"
-    
-    description = ""
-    if assignment['link']:
-        # Заменяем &amp; на & для корректного отображения в календаре
-        clean_link = assignment['link'].replace('&amp;', '&')
-        description = f"Ссылка: {clean_link}"
+    description = f"Ссылка: {assignment['link'].replace('&amp;', '&')}" if assignment['link'] else ""
     
     ics_lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Yandex Cloud//Assignment Parser//RU",
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"DTSTAMP:{dtstamp}",
-        f"DTSTART;VALUE=DATE:{dtstart}",
-        f"DTEND;VALUE=DATE:{dtend}",
-        f"SUMMARY:{summary}",
-        f"DESCRIPTION:{description}",
-        "END:VEVENT",
-        "END:VCALENDAR"
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Yandex Cloud//Assignment Parser//RU",
+        "BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{dtstamp}", f"DTSTART;VALUE=DATE:{dtstart}",
+        f"DTEND;VALUE=DATE:{dtend}", f"SUMMARY:{summary}", f"DESCRIPTION:{description}",
+        "END:VEVENT", "END:VCALENDAR"
     ]
-    
-    ics_content = "\r\n".join(ics_lines)
-    return ics_content, uid
+    return "\r\n".join(ics_lines), uid
 
 def handler(event, context):
+    print("="*50)
+    print("[START] Функция запущена")
+    
     YANDEX_EMAIL = os.environ.get('YANDEX_EMAIL', '').strip()
     YANDEX_PASSWORD = os.environ.get('YANDEX_PASSWORD', '').strip()
     ICLOUD_EMAIL = os.environ.get('ICLOUD_EMAIL', '').strip()
@@ -145,56 +120,90 @@ def handler(event, context):
     TARGET_CALENDAR_NAME = "Учеба"
     ASSIGNMENT_SUBJECT_PATTERN = "У вас есть задания, которые нужно сдать через"
     
-    if not YANDEX_EMAIL or not YANDEX_PASSWORD:
-        return {'statusCode': 500, 'body': '❌ Переменные YANDEX_EMAIL или YANDEX_PASSWORD пусты.'}
-    if not ICLOUD_EMAIL or not ICLOUD_PASSWORD:
-        return {'statusCode': 500, 'body': '❌ Переменные ICLOUD_EMAIL или ICLOUD_PASSWORD пусты.'}
+    if not all([YANDEX_EMAIL, YANDEX_PASSWORD, ICLOUD_EMAIL, ICLOUD_PASSWORD]):
+        print("[ERROR] Отсутствуют переменные окружения")
+        return {'statusCode': 500, 'body': '❌ Переменные окружения пусты.'}
     
     mail = None
+    print("[IMAP] Попытка подключения к imap.yandex.ru...")
     max_retries = 3
     for attempt in range(max_retries):
         try:
             context_ssl = ssl.create_default_context()
-            mail = imaplib.IMAP4_SSL("imap.yandex.ru", 993, ssl_context=context_ssl, timeout=10)
+            mail = imaplib.IMAP4_SSL("imap.yandex.ru", 993, ssl_context=context_ssl, timeout=15)
+            print(f"[IMAP] Попытка авторизации ({attempt + 1}/{max_retries})...")
             mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
+            print("[IMAP] ✅ Успешная авторизация в Яндекс.Почте")
             break
         except imaplib.IMAP4.error as e:
-            return {'statusCode': 500, 'body': f'❌ Ошибка авторизации в Яндекс.Почте: {str(e)}'}
+            print(f"[IMAP] ❌ Ошибка авторизации: {str(e)}")
+            return {'statusCode': 500, 'body': f'❌ Ошибка авторизации: {str(e)}'}
         except Exception as e:
+            print(f"[IMAP] ⚠️ Сетевая ошибка, повтор через 2 сек: {str(e)}")
             if attempt == max_retries - 1:
                 return {'statusCode': 500, 'body': f'❌ Yandex IMAP Error: {str(e)}'}
             time.sleep(2)
 
     try:
+        print(f"[IMAP] Выбор папки: '{TARGET_MAILBOX_NAME}'...")
         status, _ = mail.select(f'"{TARGET_MAILBOX_NAME}"')
         if status != 'OK':
             mail.logout()
             return {'statusCode': 500, 'body': f'❌ Не удалось выбрать папку "{TARGET_MAILBOX_NAME}".'}
         
+        print("[IMAP] Поиск непрочитанных писем (UNSEEN)...")
         status, messages = mail.search(None, 'UNSEEN')
         if status != 'OK' or not messages or messages[0] == b'':
             mail.logout()
+            print("[IMAP] ✅ Новых писем нет. Завершение.")
             return {'statusCode': 200, 'body': '✅ Новых непрочитанных писем нет.'}
         
         msg_ids = messages[0].split()
-        debug_info = [f"📬 Найдено непрочитанных писем: {len(msg_ids)}"]
+        print(f"[IMAP] ✅ Найдено непрочитанных писем: {len(msg_ids)}")
             
     except Exception as e:
-        if mail:
-            mail.logout()
+        if mail: mail.logout()
+        print(f"[IMAP] ❌ Ошибка обработки: {str(e)}")
         return {'statusCode': 500, 'body': f'❌ Yandex IMAP Processing Error: {str(e)}'}
     
-    # Подключение к iCloud
+    # --- iCloud CalDAV с механизмом Retry ---
+    print("[ICLOUD] Начало подключения к CalDAV...")
     try:
         auth = HTTPBasicAuth(ICLOUD_EMAIL, ICLOUD_PASSWORD)
-        headers_base = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
-            'Content-Type': 'application/xml; charset=utf-8',
-        }
+        headers_base = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15', 'Content-Type': 'application/xml; charset=utf-8'}
         
-        xml_discovery = '<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:current-user-principal/></D:prop></D:propfind>'
-        response1 = requests.request('PROPFIND', 'https://caldav.icloud.com/.well-known/caldav', headers={**headers_base, 'Depth': '0'}, auth=auth, data=xml_discovery, timeout=15, allow_redirects=False)
+        # НОВОЕ: Механизм повторных попыток для iCloud
+        max_icloud_retries = 3
+        response1 = None
         
+        for attempt in range(max_icloud_retries):
+            try:
+                print(f"[ICLOUD] Шаг 1: Попытка {attempt + 1}. Отправка PROPFIND к .well-known...")
+                xml_discovery = '<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:current-user-principal/></D:prop></D:propfind>'
+                
+                response1 = requests.request(
+                    'PROPFIND', 'https://caldav.icloud.com/.well-known/caldav',
+                    headers={**headers_base, 'Depth': '0'},
+                    auth=auth, data=xml_discovery, timeout=15, allow_redirects=False
+                )
+                print(f"[ICLOUD] Шаг 1: ✅ Получен ответ HTTP {response1.status_code}")
+                break # Успех, выходим из цикла попыток
+                
+            except requests.exceptions.Timeout:
+                print(f"[ICLOUD] ⚠️ ТАЙМАУТ соединения с Apple (попытка {attempt + 1}). Ждем 3 сек и пробуем снова...")
+                time.sleep(3)
+            except requests.exceptions.ConnectionError as e:
+                print(f"[ICLOUD] ⚠️ Ошибка соединения с Apple (попытка {attempt + 1}): {str(e)}. Ждем 3 сек...")
+                time.sleep(3)
+            except Exception as e:
+                print(f"[ICLOUD] ❌ Неожиданная ошибка при запросе: {str(e)}")
+                break
+        
+        # Если после всех попыток ответа нет
+        if response1 is None:
+            mail.logout()
+            return {'statusCode': 500, 'body': '❌ Не удалось подключиться к iCloud после 3 попыток. Сервер Apple не отвечает или блокирует IP Yandex Cloud.'}
+
         if response1.status_code in [301, 302, 307, 308]:
             principal_url = response1.headers.get('Location')
             if not principal_url.startswith('http'): principal_url = f'https://caldav.icloud.com{principal_url}'
@@ -202,10 +211,12 @@ def handler(event, context):
             principal_url = 'https://caldav.icloud.com/.well-known/caldav'
         else:
             mail.logout()
-            return {'statusCode': 500, 'body': f'❌ iCloud Discovery Error: HTTP {response1.status_code}'}
+            return {'statusCode': 500, 'body': f'❌ iCloud Discovery Error: HTTP {response1.status_code}. Ответ: {response1.text[:200]}'}
         
+        print("[ICLOUD] Шаг 2: Запрос calendar-home-set...")
         xml_home_set = '<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><C:calendar-home-set/></D:prop></D:propfind>'
         response2 = requests.request('PROPFIND', principal_url, headers={**headers_base, 'Depth': '0'}, auth=auth, data=xml_home_set, timeout=15)
+        print(f"[ICLOUD] Шаг 2: Получен HTTP {response2.status_code}")
         
         if response2.status_code not in [200, 207]:
             mail.logout()
@@ -224,8 +235,10 @@ def handler(event, context):
         if not calendar_home_url.startswith('http'):
             calendar_home_url = f'https://caldav.icloud.com{calendar_home_url}'
         
+        print("[ICLOUD] Шаг 3: Запрос списка календарей...")
         xml_calendars = '<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:displayname/><D:resourcetype/></D:prop></D:propfind>'
         response3 = requests.request('PROPFIND', calendar_home_url, headers={**headers_base, 'Depth': '1'}, auth=auth, data=xml_calendars, timeout=15)
+        print(f"[ICLOUD] Шаг 3: Получен HTTP {response3.status_code}")
         
         if response3.status_code not in [200, 207]:
             mail.logout()
@@ -253,15 +266,20 @@ def handler(event, context):
         if not target_calendar_url.startswith('http'):
             target_calendar_url = f'https://caldav.icloud.com{target_calendar_url}'
             
+        print(f"[ICLOUD] ✅ Целевой календарь найден и готов к работе")
+            
     except Exception as e:
-        if mail:
-            mail.logout()
+        if mail: mail.logout()
+        print(f"[ICLOUD] ❌ Критическая ошибка: {str(e)}")
         return {'statusCode': 500, 'body': f'❌ iCloud CalDAV Critical Error: {str(e)}'}
 
+    # --- Обработка писем ---
+        # --- Обработка писем ---
     processed_count = 0
     ics_count = 0
     
     for num in msg_ids:
+        print(f"[PROCESS] Начало обработки письма #{num.decode()}...")
         try:
             status, data = mail.fetch(num, '(RFC822)')
             if status != 'OK' or not data or not data[0]:
@@ -279,9 +297,9 @@ def handler(event, context):
                 else:
                     subject_text += part
             
-            debug_info.append(f"\n📨 Письмо #{num.decode()}: Тема='{subject_text[:60]}'")
+            print(f"[PROCESS] Тема: '{subject_text[:50]}...'")
             
-            # Проверяем .ics вложения
+            # Проверка .ics
             ics_content = None
             for part in msg.walk():
                 content_type = part.get_content_type()
@@ -291,22 +309,24 @@ def handler(event, context):
                     break
             
             if ics_content:
-                debug_info.append("   → Найден .ics файл")
+                print("[PROCESS] → Найден .ics файл")
                 ics_string = ics_content.decode('utf-8', errors='ignore')
                 uid = next((line.split(':', 1)[1].strip() for line in ics_string.split('\n') if line.startswith('UID:')), f'event-{num.decode()}')
                 
                 event_url = f'{target_calendar_url}{uid}.ics'
-                put_response = requests.put(event_url, headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'text/calendar; charset=utf-8', 'If-None-Match': '*'}, auth=auth, data=ics_string.encode('utf-8'), timeout=15)
+                print(f"[ICLOUD PUT] Отправка .ics события...")
+                put_response = requests.put(event_url, headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'text/calendar; charset=utf-8', 'If-None-Match': '*'}, auth=auth, data=ics_string.encode('utf-8'), timeout=30)
                 
                 if put_response.status_code in [201, 204]:
                     mail.store(num, '+FLAGS', '\\Seen')
                     processed_count += 1
+                    print(f"[ICLOUD PUT] ✅ Успешно (HTTP {put_response.status_code})")
                 else:
-                    debug_info.append(f"   ❌ Ошибка сохранения .ics: HTTP {put_response.status_code}")
+                    print(f"[ICLOUD PUT] ❌ Ошибка сохранения .ics: HTTP {put_response.status_code}")
             
-            # Проверяем текстовые письма с заданиями
+            # Проверка текстовых писем
             elif ASSIGNMENT_SUBJECT_PATTERN.lower() in subject_text.lower():
-                debug_info.append("   → Подходит под паттерн заданий")
+                print("[PROCESS] → Подходит под паттерн заданий. Парсинг...")
                 body_text = ''
                 html_content = ''
                 
@@ -314,37 +334,57 @@ def handler(event, context):
                     for part in msg.walk():
                         if part.get_content_type() == 'text/plain':
                             payload = part.get_payload(decode=True)
-                            if payload: body_text += payload.decode('utf-8', errors='ignore')
+                            if payload: 
+                                body_text += payload.decode('utf-8', errors='ignore')
+                                print(f"[PARSE] Извлечено text/plain: {len(body_text)} символов")
                         elif part.get_content_type() == 'text/html':
                             payload = part.get_payload(decode=True)
-                            if payload: html_content = payload.decode('utf-8', errors='ignore')
+                            if payload: 
+                                html_content += payload.decode('utf-8', errors='ignore')
+                                print(f"[PARSE] Извлечено text/html: {len(html_content)} символов")
                 else:
                     payload = msg.get_payload(decode=True)
-                    if payload: body_text = payload.decode('utf-8', errors='ignore')
+                    if payload: 
+                        body_text = payload.decode('utf-8', errors='ignore')
+                        print(f"[PARSE] Извлечено тело письма: {len(body_text)} символов")
                 
+                print(f"[PARSE] Запуск parse_assignment_email...")
                 assignments, parse_log = parse_assignment_email(body_text, html_content)
-                debug_info.extend([f"   {log}" for log in parse_log])
+                
+                # НОВОЕ: Логируем результаты парсинга
+                print(f"[PARSE] Результат: найдено {len(assignments)} заданий")
+                for log in parse_log:
+                    print(f"[PARSE] {log}")
+                
+                if not assignments:
+                    print(f"[PARSE] ⚠️ ВНИМАНИЕ: Парсер не нашел заданий в тексте!")
+                    print(f"[PARSE] Первые 200 символов body_text: '{body_text[:200]}'")
                 
                 for assignment in assignments:
                     ics_content, uid = generate_ics_for_assignment(assignment)
                     event_url = f'{target_calendar_url}{uid}.ics'
-                    put_response = requests.put(event_url, headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'text/calendar; charset=utf-8', 'If-None-Match': '*'}, auth=auth, data=ics_content.encode('utf-8'), timeout=15)
+                    print(f"[ICLOUD PUT] Отправка события: '{assignment['task_name']}'...")
+                    put_response = requests.put(event_url, headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'text/calendar; charset=utf-8', 'If-None-Match': '*'}, auth=auth, data=ics_content.encode('utf-8'), timeout=30)
                     
                     if put_response.status_code in [201, 204]:
                         ics_count += 1
-                        debug_info.append(f"   ✅ Событие создано: {assignment['task_name']}")
+                        print(f"[ICLOUD PUT] ✅ Успешно (HTTP {put_response.status_code})")
                     else:
-                        debug_info.append(f"   ❌ Ошибка создания: HTTP {put_response.status_code}")
+                        print(f"[ICLOUD PUT] ❌ Ошибка создания: HTTP {put_response.status_code}")
                 
                 mail.store(num, '+FLAGS', '\\Seen')
                 processed_count += 1
             else:
-                debug_info.append("   → Не подходит под паттерн, пропускаем")
+                print("[PROCESS] → Не подходит под паттерн, пропускаем")
                 
         except Exception as e:
-            debug_info.append(f"   ❌ Ошибка обработки: {str(e)}")
+            print(f"[PROCESS] ❌ Ошибка обработки письма #{num.decode()}: {str(e)}")
+            import traceback
+            print(f"[PROCESS] Stack trace: {traceback.format_exc()}")
             continue
 
+    print("[END] Выход из IMAP и успешное завершение функции.")
     mail.logout()
-    report = f"✅ Обработано писем: {processed_count}. Создано событий из текста: {ics_count}\n\n" + "\n".join(debug_info)
+    
+    report = f"✅ Обработано писем: {processed_count}. Создано событий из текста: {ics_count}"
     return {'statusCode': 200, 'body': report}
