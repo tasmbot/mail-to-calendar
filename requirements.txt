@@ -1,2 +1,1 @@
-requests
-icalendar
+requests>=2.31,<3
